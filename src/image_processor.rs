@@ -37,12 +37,19 @@ impl ImageProcessor {
             // Generate output filename
             let base_filename = format!("{}_{}.png", Path::new(input_path).file_stem().and_then(|s| s.to_str()).unwrap_or("output"), i + 1);
             
-            // Determine output path
-            let output_filename = if let Some(ref output_dir) = self.config.output_dir {
-                format!("{}/{}", output_dir, base_filename)
+            // Determine output directory
+            let output_dir = if let Some(ref custom_dir) = self.config.output_dir {
+                custom_dir.clone()
             } else {
-                base_filename
+                // Default to the input file's directory
+                Path::new(input_path)
+                    .parent()
+                    .and_then(|p| p.to_str())
+                    .unwrap_or(".")
+                    .to_string()
             };
+            
+            let output_filename = format!("{}/{}", output_dir, base_filename);
             
             cropped_img
                 .save(&output_filename)
@@ -111,11 +118,20 @@ impl ImageProcessor {
         }
 
         let debug_filename = format!("{}_debug.png", Path::new(input_path).file_stem().and_then(|s| s.to_str()).unwrap_or("debug"));
-        let output_path = if let Some(ref output_dir) = self.config.output_dir {
-            format!("{}/{}", output_dir, debug_filename)
+        
+        // Determine output directory
+        let output_dir = if let Some(ref custom_dir) = self.config.output_dir {
+            custom_dir.clone()
         } else {
-            debug_filename
+            // Default to the input file's directory
+            Path::new(input_path)
+                .parent()
+                .and_then(|p| p.to_str())
+                .unwrap_or(".")
+                .to_string()
         };
+        
+        let output_path = format!("{}/{}", output_dir, debug_filename);
 
         debug_img
             .save(&output_path)
