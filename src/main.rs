@@ -1,7 +1,7 @@
 use clap::{ArgGroup, Parser};
 use geo::algorithm::bounding_rect::BoundingRect;
 use image::{imageops, GenericImageView, GrayImage};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
@@ -88,14 +88,22 @@ struct Cli {
     /// Enable debug logging (implies verbose)
     #[arg(long, action = clap::ArgAction::SetTrue)]
     debug: bool,
+
+    /// Optional prefix for filtering files in a folder
+    #[arg(long, default_value = "IMG_")]
+    prefix: String,
+
+    /// Enable daemon mode to watch a folder for new files
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    daemon: bool,
 }
 
 fn determine_path_type(input: &str) -> Result<&str, &str> {
     let path = Path::new(input);
-    if path.is_file() {
+    if path.is_dir() {
+        Ok("folder")
+    } else if path.is_file() {
         Ok("file")
-    } else if path.is_dir() {
-        Err("Folder paths are not supported yet.")
     } else {
         Err("Invalid path.")
     }
@@ -107,7 +115,7 @@ fn process_image(img: &image::DynamicImage) -> Result<(GrayImage, f64), String> 
     let new_width = (width as f64 * scaling_factor) as u32;
 
     let start_time = start_timer!("Image resizing");
-    let resized_img = img.resize(new_width, 500, imageops::FilterType::Lanczos3);
+    let resized_img = img.resize(new_width, 500, imageops::FilterType::Triangle);
     stop_timer!(start_time, "Image resizing");
 
     let start_time = start_timer!("Converting image to grayscale");
@@ -128,7 +136,7 @@ fn detect_edges(_image: &GrayImage) -> Vec<geo::Rect<u32>> {
 
     let step_time = start_timer!("Find contours");
     let contours: Vec<imageproc::contours::Contour<u32>> =
-        imageproc::contours::find_contours_with_threshold(&blurred_img, 25);
+        imageproc::contours::find_contours_with_threshold(&blurred_img, 15);
     stop_timer!(step_time, "Find contours");
 
     log_message!(
@@ -196,87 +204,35 @@ fn detect_edges(_image: &GrayImage) -> Vec<geo::Rect<u32>> {
     rects
 }
 
-fn main() {
-    let args = Cli::parse();
-    set_verbosity_level(args.verbose, args.debug);
-
-    let debug_enabled = VERBOSITY_LEVEL.load(Ordering::Relaxed) == LogLevel::Debug as usize;
-
-    log_message!(LogLevel::Info, "Starting the application");
-
-    match determine_path_type(&args.input) {
-        Ok("file") => log_message!(LogLevel::Info, "File path detected"),
-        Err(e) => {
-            log_message!(LogLevel::Error, e);
-            return;
-        }
-        _ => unreachable!(),
-    }
-
-    let start_time = Instant::now();
-
-    let img = image::open(&args.input).expect("Failed to load image");
+fn process_and_crop_image(input_path: &str, _prefix: &str, debug_enabled: bool) -> Vec<String> {
+    let img = image::open(input_path).expect("Failed to load image");
     let (processed_img, scaling_factor) = process_image(&img).expect("Image processing failed");
 
-    log_message!(LogLevel::Info, "Image processing completed");
-
-    // Get the dimensions of the image
-    let (width, height) = processed_img.dimensions();
-    log_message!(LogLevel::Debug, "==============================");
-    log_message!(
-        LogLevel::Debug,
-        &format!("Processed image dimensions: {}x{}", width, height)
-    );
-    log_message!(
-        LogLevel::Debug,
-        &format!("Scaling factor: {}", scaling_factor)
-    );
-    log_message!(LogLevel::Debug, "==============================");
+    log_message!(LogLevel::Info, format!("Cropping image: {}", input_path));
 
     let bounding_boxes = detect_edges(&processed_img);
+    let mut output_files = Vec::new();
 
-    // Perform cropping operations
     for (i, rect) in bounding_boxes.iter().enumerate() {
         let scaled_x = (rect.min().x as f64 / scaling_factor).floor() as u32;
         let scaled_y = (rect.min().y as f64 / scaling_factor).floor() as u32;
         let scaled_w = (rect.width() as f64 / scaling_factor).ceil() as u32;
         let scaled_h = (rect.height() as f64 / scaling_factor).ceil() as u32;
 
-        // assert that the cropping rectangle is within the image bounds
         assert!(scaled_x + scaled_w <= img.width());
         assert!(scaled_y + scaled_h <= img.height());
 
-        // print cropping rectangle details
-        log_message!(
-            LogLevel::Debug,
-            &format!(
-                "Cropping rectangle {}: x={}, y={}, w={}, h={}",
-                i + 1,
-                scaled_x,
-                scaled_y,
-                scaled_w,
-                scaled_h
-            )
-        );
-
         let cropped_img = img.crop_imm(scaled_x, scaled_y, scaled_w, scaled_h);
-        let output_filename = format!("{}_{}.png", args.input.trim_end_matches(".png"), i + 1);
+        let output_filename = format!("{}_{}.png", input_path.trim_end_matches(".png"), i + 1);
         cropped_img.save(&output_filename).expect(&format!(
             "Failed to save cropped image: {}",
             output_filename
         ));
+        output_files.push(output_filename);
     }
 
-    // Debug-specific logic: Save an image with boundary boxes drawn on the original image
-    // Convert the grayscale processed image to RGB format manually
     if debug_enabled {
         let mut debug_img = img.clone().to_rgb8();
-
-        let mut debug_processed_img =
-            image::ImageBuffer::from_fn(processed_img.width(), processed_img.height(), |x, y| {
-                let pixel = processed_img.get_pixel(x, y);
-                image::Rgb([pixel[0], pixel[0], pixel[0]])
-            });
 
         for rect in bounding_boxes.iter() {
             let scaled_x = (rect.min().x as f64 / scaling_factor).round() as u32;
@@ -290,26 +246,138 @@ fn main() {
                     .of_size(scaled_w, scaled_h),
                 image::Rgb([255, 0, 0]),
             );
-
-            imageproc::drawing::draw_hollow_rect_mut(
-                &mut debug_processed_img,
-                imageproc::rect::Rect::at(rect.min().x as i32, rect.min().y as i32)
-                    .of_size(rect.width(), rect.height()),
-                image::Rgb([0, 255, 0]),
-            );
         }
 
         debug_img
             .save("debug_with_bounding_boxes.png")
             .expect("Failed to save debug image with bounding boxes");
+    }
 
-        debug_processed_img
-            .save("scaled_down_with_boxes.png")
-            .expect("Failed to save debug processed image with bounding boxes");
+    log_message!(LogLevel::Info, format!("Completed cropping image: {}", input_path));
+
+    output_files
+}
+
+fn main() {
+    let args = Cli::parse();
+    set_verbosity_level(args.verbose, args.debug);
+
+    let debug_enabled = VERBOSITY_LEVEL.load(Ordering::Relaxed) == LogLevel::Debug as usize;
+
+    log_message!(LogLevel::Info, "Starting the application");
+
+    if args.daemon {
+        log_message!(LogLevel::Info, "Daemon mode enabled. Watching folder for new files...");
+
+        let folder_path = Path::new(&args.input);
+        if !folder_path.is_dir() {
+            log_message!(LogLevel::Error, "Daemon mode requires a valid folder path.");
+            return;
+        }
+
+        let mut processed_files: std::collections::HashSet<std::path::PathBuf> = std::fs::read_dir(folder_path)
+            .expect("Failed to read folder")
+            .filter_map(|entry| entry.ok().map(|e| e.path()))
+            .collect();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let prefix = args.prefix.clone();
+        let mut watcher = notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
+            if let Ok(event) = res {
+                if let notify::EventKind::Create(_) = event.kind {
+                    for path in event.paths {
+                        if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
+                            if file_name.starts_with(&prefix) {
+                                tx.send(path).expect("Failed to send path through channel");
+                            }
+                        }
+                    }
+                }
+            }
+        }).expect("Failed to create watcher");
+
+        notify::Watcher::watch(&mut watcher, folder_path, notify::RecursiveMode::NonRecursive)
+            .expect("Failed to watch folder");
+
+        log_message!(
+            LogLevel::Info,
+            &format!("Pre-populated processed files with {} existing files.", processed_files.len())
+        );
+
+        for path in rx {
+            if processed_files.contains(&path) {
+                log_message!(LogLevel::Verbose, &format!("File {:?} already processed. Skipping.", path));
+                continue;
+            }
+
+            log_message!(LogLevel::Info, &format!("New file detected: {:?}", path));
+
+            let mut attempts = 0;
+            loop {
+                match image::open(&path) {
+                    Ok(_) => break,
+                    Err(e) if attempts < 10 => {
+                        attempts += 1;
+                        log_message!(
+                            LogLevel::Debug,
+                            &format!(
+                                "Attempt {} to open file {:?} failed: {}. Retrying...",
+                                attempts, path, e
+                            )
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(2u64.pow(attempts) * 100));
+                    }
+                    Err(e) => {
+                        log_message!(
+                            LogLevel::Error,
+                            &format!("Failed to open file {:?} after 10 attempts: {}", path, e)
+                        );
+                        return;
+                    }
+                }
+            }
+
+            let output_files = process_and_crop_image(path.to_str().unwrap(), &args.prefix, debug_enabled);
+            processed_files.extend(output_files.into_iter().map(PathBuf::from));
+        }
+
+        return;
+    }
+
+    let step_time = Instant::now();
+
+    match determine_path_type(&args.input) {
+        Ok("file") => {
+            log_message!(LogLevel::Info, "File path detected");
+            process_and_crop_image(&args.input, &args.prefix, debug_enabled);
+        }
+        Ok("folder") => {
+            log_message!(LogLevel::Info, "Folder path detected");
+            for entry in std::fs::read_dir(&args.input).expect("Failed to read folder") {
+                let entry = entry.expect("Failed to read entry");
+                let path = entry.path();
+                if path.is_file() {
+                    if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
+                        if file_name.starts_with(&args.prefix) {
+                            process_and_crop_image(
+                                path.to_str().unwrap(),
+                                &args.prefix,
+                                debug_enabled,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            log_message!(LogLevel::Error, e);
+            return;
+        }
+        _ => unreachable!(),
     }
 
     println!("==============================");
-    let duration = start_time.elapsed();
+    let duration = step_time.elapsed();
     log_message!(LogLevel::Info, &format!("Total time: {:.2?}", duration));
     println!("==============================");
 }
