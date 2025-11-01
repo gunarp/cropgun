@@ -5,5 +5,7 @@ edition = "2021"
 
 [dependencies]
 clap = { version = "4.0", features = ["derive"] }
+geo = "0.31.0"
 image = "0.25.8"
 imageproc = "0.25.0"
+once_cell = "1.17"
