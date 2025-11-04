@@ -33,16 +33,21 @@ pub fn process_image(img: &image::DynamicImage, preprocess_mode: PreprocessingMo
 
 pub fn detect_edges(_image: &GrayImage) -> Vec<geo::Rect<u32>> {
     let step_time = start_timer!("Applying Gaussian blur");
-    let mut blurred_img = imageproc::filter::gaussian_blur_f32(&_image, 1.25);
+    let blurred_img = imageproc::filter::gaussian_blur_f32(&_image, 1.25);
     stop_timer!(step_time, "Applying Gaussian blur");
 
+    let step_time = start_timer!("Morphological erosion");
+    let eroded = imageproc::morphology::erode(&blurred_img, imageproc::distance_transform::Norm::L2, 1);
+    stop_timer!(step_time, "Morphological erosion");
+
     let step_time = start_timer!("Inverting image");
-    imageops::colorops::invert(&mut blurred_img);
+    let mut inverted_img = eroded.clone();
+    imageops::colorops::invert(&mut inverted_img);
     stop_timer!(step_time, "Inverting image");
 
     let step_time = start_timer!("Find contours");
     let contours: Vec<imageproc::contours::Contour<u32>> =
-        imageproc::contours::find_contours_with_threshold(&blurred_img, 15);
+        imageproc::contours::find_contours_with_threshold(&inverted_img, 15);
     stop_timer!(step_time, "Find contours");
 
     log_message!(
@@ -77,31 +82,38 @@ pub fn detect_edges(_image: &GrayImage) -> Vec<geo::Rect<u32>> {
 
         let bounding_rect = points.bounding_rect().unwrap();
         let rect_area = bounding_rect.width() * bounding_rect.height();
+        
+        // Filter by aspect ratio to reject thin lines (like scanner artifacts)
+        let width = bounding_rect.width() as f32;
+        let height = bounding_rect.height() as f32;
+        let aspect_ratio = width.max(height) / width.min(height);
 
-        if rect_area >= min_area {
+        if rect_area >= min_area && aspect_ratio < 5.0 {
             rects.push(bounding_rect);
 
             log_message!(
                 LogLevel::Debug,
                 &format!(
-                    "Bounding box: x={}, y={}, w={}, h={} (area: {})",
+                    "Bounding box: x={}, y={}, w={}, h={} (area: {}, aspect ratio: {:.2})",
                     bounding_rect.min().x,
                     bounding_rect.min().y,
-                    bounding_rect.width(),
-                    bounding_rect.height(),
-                    rect_area
+                    width as u32,
+                    height as u32,
+                    rect_area,
+                    aspect_ratio
                 )
             );
         } else {
             log_message!(
                 LogLevel::Debug,
                 &format!(
-                    "Filtered out bounding box: x={}, y={}, w={}, h={} (area: {})",
+                    "Filtered out bounding box: x={}, y={}, w={}, h={} (area: {}, aspect ratio: {:.2})",
                     bounding_rect.min().x,
                     bounding_rect.min().y,
-                    bounding_rect.width(),
-                    bounding_rect.height(),
-                    rect_area
+                    width as u32,
+                    height as u32,
+                    rect_area,
+                    aspect_ratio
                 )
             );
         }
