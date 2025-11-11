@@ -254,6 +254,10 @@ pub fn process_image(img: &image::DynamicImage, preprocess_mode: PreprocessingMo
 }
 
 pub fn detect_edges(_image: &GrayImage, debug_enabled: bool) -> DetectionResult {
+    detect_edges_with_options(_image, debug_enabled, true)
+}
+
+pub fn detect_edges_with_options(_image: &GrayImage, debug_enabled: bool, filter_oversized: bool) -> DetectionResult {
     let step_time = start_timer!("Applying Gaussian blur");
     let blurred_img = imageproc::filter::gaussian_blur_f32(&_image, 2.5);
     stop_timer!(step_time, "Applying Gaussian blur");
@@ -389,32 +393,35 @@ pub fn detect_edges(_image: &GrayImage, debug_enabled: bool) -> DetectionResult 
     }
 
     // Filter out bounding boxes that are too large (more than 95% of image)
-    let max_area = (image_area as f32 * 0.95) as u32;
-    let original_count = detected_photos.len();
-    detected_photos.retain(|(rect, _, _)| {
-        let area = rect.width() * rect.height();
-        let is_valid = area <= max_area;
-        if !is_valid {
+    // Skip this filter for recursive processing
+    if filter_oversized {
+        let max_area = (image_area as f32 * 0.95) as u32;
+        let original_count = detected_photos.len();
+        detected_photos.retain(|(rect, _, _)| {
+            let area = rect.width() * rect.height();
+            let is_valid = area <= max_area;
+            if !is_valid {
+                log_message!(
+                    LogLevel::Debug,
+                    &format!(
+                        "Filtered out oversized box: x={}, y={}, w={}, h={} (area: {}, {}% of image)",
+                        rect.min().x,
+                        rect.min().y,
+                        rect.width(),
+                        rect.height(),
+                        area,
+                        (area as f32 / image_area as f32 * 100.0) as u32
+                    )
+                );
+            }
+            is_valid
+        });
+        if original_count != detected_photos.len() {
             log_message!(
                 LogLevel::Debug,
-                &format!(
-                    "Filtered out oversized box: x={}, y={}, w={}, h={} (area: {}, {}% of image)",
-                    rect.min().x,
-                    rect.min().y,
-                    rect.width(),
-                    rect.height(),
-                    area,
-                    (area as f32 / image_area as f32 * 100.0) as u32
-                )
+                &format!("Filtered out {} oversized boxes", original_count - detected_photos.len())
             );
         }
-        is_valid
-    });
-    if original_count != detected_photos.len() {
-        log_message!(
-            LogLevel::Debug,
-            &format!("Filtered out {} oversized boxes", original_count - detected_photos.len())
-        );
     }
 
     // Filter out bounding boxes that touch the image borders
