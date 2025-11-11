@@ -2,6 +2,63 @@ use crate::config::{LogLevel, ProcessingConfig, ProcessingResult};
 use crate::image_ops::{detect_edges, process_image};
 use crate::log_message;
 use std::path::Path;
+use image::GenericImageView;
+
+/// Rotate an image by the specified angle (in degrees, positive = clockwise)
+fn rotate_image(img: image::DynamicImage, angle_degrees: f64) -> image::DynamicImage {
+    use image::imageops;
+    
+    // Normalize angle to [-180, 180]
+    let angle = angle_degrees % 360.0;
+    let angle = if angle > 180.0 { angle - 360.0 } else if angle < -180.0 { angle + 360.0 } else { angle };
+    
+    // For angles close to 90 degree increments, use fast rotation
+    if (angle - 90.0).abs() < 1.0 {
+        return image::DynamicImage::ImageRgba8(imageops::rotate90(&img.to_rgba8()));
+    } else if (angle - 180.0).abs() < 1.0 || (angle + 180.0).abs() < 1.0 {
+        return image::DynamicImage::ImageRgba8(imageops::rotate180(&img.to_rgba8()));
+    } else if (angle - 270.0).abs() < 1.0 || (angle + 90.0).abs() < 1.0 {
+        return image::DynamicImage::ImageRgba8(imageops::rotate270(&img.to_rgba8()));
+    }
+    
+    // For arbitrary angles, we need to do a proper rotation with interpolation
+    // This is a simplified version - for production you'd want imageproc::geometric_transformations
+    // For now, use a rotation approximation
+    let angle_rad = -angle.to_radians(); // Negative because image coordinates
+    let (width, height) = img.dimensions();
+    let center_x = width as f64 / 2.0;
+    let center_y = height as f64 / 2.0;
+    
+    // Calculate new image dimensions to fit rotated image
+    let cos_a = angle_rad.cos().abs();
+    let sin_a = angle_rad.sin().abs();
+    let new_width = ((width as f64 * cos_a) + (height as f64 * sin_a)).ceil() as u32;
+    let new_height = ((height as f64 * cos_a) + (width as f64 * sin_a)).ceil() as u32;
+    
+    let mut rotated = image::RgbaImage::from_pixel(new_width, new_height, image::Rgba([255, 255, 255, 255]));
+    let img_rgba = img.to_rgba8();
+    
+    let new_center_x = new_width as f64 / 2.0;
+    let new_center_y = new_height as f64 / 2.0;
+    
+    // Rotate each pixel (using inverse mapping for better quality)
+    for y in 0..new_height {
+        for x in 0..new_width {
+            let dx = x as f64 - new_center_x;
+            let dy = y as f64 - new_center_y;
+            
+            // Apply inverse rotation
+            let src_x = (dx * angle_rad.cos() - dy * angle_rad.sin() + center_x).round() as i32;
+            let src_y = (dx * angle_rad.sin() + dy * angle_rad.cos() + center_y).round() as i32;
+            
+            if src_x >= 0 && src_x < width as i32 && src_y >= 0 && src_y < height as i32 {
+                rotated.put_pixel(x, y, *img_rgba.get_pixel(src_x as u32, src_y as u32));
+            }
+        }
+    }
+    
+    image::DynamicImage::ImageRgba8(rotated)
+}
 
 pub struct ImageProcessor {
     config: ProcessingConfig,
@@ -20,10 +77,13 @@ impl ImageProcessor {
         log_message!(LogLevel::Info, &format!("Image processing completed for {}", input_path));
 
         let detection_result = detect_edges(&processed_img, self.config.debug_enabled);
-        let bounding_boxes = &detection_result.rects;
+        let detected_photos = &detection_result.photos;
         let mut output_files = Vec::new();
 
-        for (i, rect) in bounding_boxes.iter().enumerate() {
+        for (i, photo) in detected_photos.iter().enumerate() {
+            let rect = &photo.rect;
+            let rotation_angle = photo.rotation_angle;
+            
             let scaled_x = (rect.min().x as f64 / scaling_factor).floor() as u32;
             let scaled_y = (rect.min().y as f64 / scaling_factor).floor() as u32;
             let scaled_w = (rect.width() as f64 / scaling_factor).ceil() as u32;
@@ -33,7 +93,16 @@ impl ImageProcessor {
                 return Err("Crop rectangle exceeds image bounds".to_string());
             }
 
-            let cropped_img = img.crop_imm(scaled_x, scaled_y, scaled_w, scaled_h);
+            let mut cropped_img = img.crop_imm(scaled_x, scaled_y, scaled_w, scaled_h);
+            
+            // Apply rotation if needed
+            if rotation_angle.abs() > 0.5 {
+                cropped_img = rotate_image(cropped_img, rotation_angle);
+                log_message!(
+                    LogLevel::Debug,
+                    &format!("Rotated image {} by {:.1}°", i + 1, rotation_angle)
+                );
+            }
             
             // Generate output filename
             let base_filename = format!("{}_{}.png", Path::new(input_path).file_stem().and_then(|s| s.to_str()).unwrap_or("output"), i + 1);
@@ -129,8 +198,9 @@ impl ImageProcessor {
         let mut result_img = img.clone().to_rgb8();
         
         // Draw rejected candidates in red
+        let accepted_rects: Vec<_> = detection_result.photos.iter().map(|p| &p.rect).collect();
         for (rect, rectangularity) in &debug_info.all_contours {
-            let is_accepted = detection_result.rects.contains(rect);
+            let is_accepted = accepted_rects.contains(&rect);
             if !is_accepted {
                 let scaled_x = (rect.min().x as f64 / scaling_factor).round() as u32;
                 let scaled_y = (rect.min().y as f64 / scaling_factor).round() as u32;
@@ -151,7 +221,8 @@ impl ImageProcessor {
         }
         
         // Draw accepted boxes in green (on top)
-        for rect in &detection_result.rects {
+        for photo in &detection_result.photos {
+            let rect = &photo.rect;
             let scaled_x = (rect.min().x as f64 / scaling_factor).round() as u32;
             let scaled_y = (rect.min().y as f64 / scaling_factor).round() as u32;
             let scaled_w = (rect.width() as f64 / scaling_factor).round() as u32;
@@ -164,7 +235,13 @@ impl ImageProcessor {
                 .map(|(_, s)| *s)
                 .unwrap_or(0.0);
             
-            // Draw green box for accepted
+            // Draw green box for accepted (with rotation angle if present)
+            let label = if photo.rotation_angle.abs() > 0.5 {
+                format!("✓ {:.2} (∠{:.1}°)", rectangularity, photo.rotation_angle)
+            } else {
+                format!("✓ {:.2}", rectangularity)
+            };
+            
             draw_rect_with_label(
                 &mut result_img,
                 scaled_x,
@@ -172,7 +249,7 @@ impl ImageProcessor {
                 scaled_w,
                 scaled_h,
                 Rgb([0, 255, 0]),
-                &format!("✓ {:.2}", rectangularity)
+                &label
             );
         }
         

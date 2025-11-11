@@ -16,9 +16,16 @@ pub struct DebugInfo {
     pub all_contours: Vec<(geo::Rect<u32>, f64)>, // (rect, rectangularity score)
 }
 
+/// Information about a detected photo including its bounding box and rotation
+#[derive(Clone, Debug)]
+pub struct DetectedPhoto {
+    pub rect: geo::Rect<u32>,
+    pub rotation_angle: f64, // in degrees, positive = clockwise
+}
+
 /// Result of edge detection with optional debug info
 pub struct DetectionResult {
-    pub rects: Vec<geo::Rect<u32>>,
+    pub photos: Vec<DetectedPhoto>,
     pub debug_info: Option<DebugInfo>,
 }
 
@@ -48,8 +55,11 @@ fn merge_overlapping_rects(rects: Vec<geo::Rect<u32>>) -> Vec<geo::Rect<u32>> {
                     continue;
                 }
 
-                // Check if rectangles overlap or are very close (within 10% of smaller dimension)
-                let tolerance = ((current.width().min(current.height()) as f64) * 0.1) as u32;
+                // Check if rectangles overlap or are very close (within 20% of smaller dimension)
+                // Use the smaller dimension between BOTH rectangles for tolerance calculation
+                let current_min_dim = current.width().min(current.height());
+                let other_min_dim = rects[j].width().min(rects[j].height());
+                let tolerance = ((current_min_dim.min(other_min_dim) as f64) * 0.1) as u32;
                 
                 let current_expanded = geo::Rect::new(
                     geo::Coord {
@@ -99,6 +109,78 @@ fn merge_overlapping_rects(rects: Vec<geo::Rect<u32>>) -> Vec<geo::Rect<u32>> {
     }
 
     merged
+}
+
+/// Calculate rotation angle of a contour using minimum area bounding rectangle
+/// Returns angle in degrees (positive = clockwise rotation needed to straighten)
+fn calculate_rotation_angle(contour: &imageproc::contours::Contour<u32>) -> f64 {
+    if contour.points.len() < 4 {
+        return 0.0;
+    }
+
+    let points = &contour.points;
+    
+    // Find extreme points (top-left, top-right, bottom-left, bottom-right)
+    // by looking at corners of the axis-aligned bounding box
+    let min_x = points.iter().map(|p| p.x).min().unwrap();
+    let max_x = points.iter().map(|p| p.x).max().unwrap();
+    let min_y = points.iter().map(|p| p.y).min().unwrap();
+    let max_y = points.iter().map(|p| p.y).max().unwrap();
+    
+    // For each corner region, find the actual contour point closest to that corner
+    // Top-left region
+    let tl = points.iter()
+        .filter(|p| p.x < min_x + (max_x - min_x) / 3 && p.y < min_y + (max_y - min_y) / 3)
+        .min_by_key(|p| (p.x as i64 - min_x as i64).pow(2) + (p.y as i64 - min_y as i64).pow(2))
+        .or_else(|| points.iter().min_by_key(|p| (p.x as i64 - min_x as i64).pow(2) + (p.y as i64 - min_y as i64).pow(2)));
+    
+    // Top-right region
+    let tr = points.iter()
+        .filter(|p| p.x > max_x - (max_x - min_x) / 3 && p.y < min_y + (max_y - min_y) / 3)
+        .min_by_key(|p| (p.x as i64 - max_x as i64).pow(2) + (p.y as i64 - min_y as i64).pow(2))
+        .or_else(|| points.iter().min_by_key(|p| (p.x as i64 - max_x as i64).pow(2) + (p.y as i64 - min_y as i64).pow(2)));
+    
+    // Bottom-left region
+    let bl = points.iter()
+        .filter(|p| p.x < min_x + (max_x - min_x) / 3 && p.y > max_y - (max_y - min_y) / 3)
+        .min_by_key(|p| (p.x as i64 - min_x as i64).pow(2) + (p.y as i64 - max_y as i64).pow(2))
+        .or_else(|| points.iter().min_by_key(|p| (p.x as i64 - min_x as i64).pow(2) + (p.y as i64 - max_y as i64).pow(2)));
+    
+    // Bottom-right region  
+    let br = points.iter()
+        .filter(|p| p.x > max_x - (max_x - min_x) / 3 && p.y > max_y - (max_y - min_y) / 3)
+        .min_by_key(|p| (p.x as i64 - max_x as i64).pow(2) + (p.y as i64 - max_y as i64).pow(2))
+        .or_else(|| points.iter().min_by_key(|p| (p.x as i64 - max_x as i64).pow(2) + (p.y as i64 - max_y as i64).pow(2)));
+    
+    // Calculate angles from edges if we found valid corners
+    if let (Some(tl), Some(tr), Some(bl), Some(br)) = (tl, tr, bl, br) {
+        // Calculate angle from top edge (most reliable for scanned photos)
+        let top_dx = tr.x as f64 - tl.x as f64;
+        let top_dy = tr.y as f64 - tl.y as f64;
+        let top_angle = top_dy.atan2(top_dx).to_degrees();
+        
+        // Calculate angle from bottom edge
+        let bottom_dx = br.x as f64 - bl.x as f64;
+        let bottom_dy = br.y as f64 - bl.y as f64;
+        let bottom_angle = bottom_dy.atan2(bottom_dx).to_degrees();
+        
+        // Average the two angles for more stability
+        let avg_angle = (top_angle + bottom_angle) / 2.0;
+        
+        // Normalize to [-45, 45] range (since rectangles have 90° symmetry)
+        let normalized_angle = if avg_angle > 45.0 {
+            avg_angle - 90.0
+        } else if avg_angle < -45.0 {
+            avg_angle + 90.0
+        } else {
+            avg_angle
+        };
+        
+        // Return negative angle (since we want the angle to rotate back to upright)
+        -normalized_angle
+    } else {
+        0.0
+    }
 }
 
 /// Calculate how rectangular a contour is (0.0 = not rectangular, 1.0 = perfect rectangle)
@@ -178,7 +260,7 @@ pub fn detect_edges(_image: &GrayImage, debug_enabled: bool) -> DetectionResult 
 
     let step_time = start_timer!("Canny edge detection");
     // Lower thresholds to detect more edges, especially for photos with similar background colors
-    let edges = imageproc::edges::canny(&blurred_img, 40.0, 50.0);
+    let edges = imageproc::edges::canny(&blurred_img, 5.0, 40.0);
     stop_timer!(step_time, "Canny edge detection");
 
     let step_time = start_timer!("Morphological operations");
@@ -207,14 +289,17 @@ pub fn detect_edges(_image: &GrayImage, debug_enabled: bool) -> DetectionResult 
         &format!("Found {} contours", contours.len())
     );
 
-    let mut rects: Vec<geo::Rect<u32>> = vec![];
+    let mut detected_photos: Vec<(geo::Rect<u32>, f64, &imageproc::contours::Contour<u32>)> = vec![]; // (rect, rectangularity, contour)
+    let mut potential_candidates: Vec<(geo::Rect<u32>, f64, &imageproc::contours::Contour<u32>)> = vec![]; // mid-sized candidates
     let mut all_contours_debug: Vec<(geo::Rect<u32>, f64)> = vec![];
     let image_area = _image.width() * _image.height();
     let min_area = (image_area as f32 * 0.05) as u32;
+    let candidate_min_area = (image_area as f32 * 0.02) as u32; // Lower threshold for candidates
     let min_rectangularity = 0.3; // Minimum score to be considered a rectangle
+    let candidate_min_rectangularity = 0.2; // Lower threshold for candidates
     let mut filtered_count = 0;
 
-    for contour in contours {
+    for contour in &contours {
         // Skip hole contours - we only want outer boundaries
         if matches!(contour.border_type, imageproc::contours::BorderType::Hole) {
             continue;
@@ -240,15 +325,24 @@ pub fn detect_edges(_image: &GrayImage, debug_enabled: bool) -> DetectionResult 
             all_contours_debug.push((bounding_rect, rectangularity));
         }
 
-        // Filter by area, rectangularity, and minimum dimensions
         let min_dimension = 50; // Minimum width or height in pixels
-        let is_valid = rect_area >= min_area 
+        
+        // Check if this meets the high threshold for detected photos
+        let is_detected = rect_area >= min_area 
             && rectangularity >= min_rectangularity
             && bounding_rect.width() >= min_dimension
             && bounding_rect.height() >= min_dimension;
 
-        if is_valid {
-            rects.push(bounding_rect);
+        // Check if this meets the lower threshold for potential candidates
+        let is_candidate = !is_detected 
+            && rect_area >= candidate_min_area
+            && rect_area < min_area  // Must be mid-sized (between candidate and detected thresholds)
+            && rectangularity >= candidate_min_rectangularity
+            && bounding_rect.width() >= min_dimension
+            && bounding_rect.height() >= min_dimension;
+
+        if is_detected {
+            detected_photos.push((bounding_rect, rectangularity, contour));
 
             log_message!(
                 LogLevel::Debug,
@@ -262,12 +356,31 @@ pub fn detect_edges(_image: &GrayImage, debug_enabled: bool) -> DetectionResult 
                     rectangularity
                 )
             );
+        } else if is_candidate {
+            potential_candidates.push((bounding_rect, rectangularity, contour));
+
+            log_message!(
+                LogLevel::Debug,
+                &format!(
+                    "Potential candidate: x={}, y={}, w={}, h={} (area: {}, rectangularity: {:.2})",
+                    bounding_rect.min().x,
+                    bounding_rect.min().y,
+                    bounding_rect.width(),
+                    bounding_rect.height(),
+                    rect_area,
+                    rectangularity
+                )
+            );
         } else {
             filtered_count += 1;
         }
     }
 
-    // Log summary of filtered contours
+    // Log summary
+    log_message!(
+        LogLevel::Debug,
+        &format!("Found {} detected photos, {} potential candidates", detected_photos.len(), potential_candidates.len())
+    );
     if filtered_count > 0 {
         log_message!(
             LogLevel::Debug,
@@ -277,8 +390,8 @@ pub fn detect_edges(_image: &GrayImage, debug_enabled: bool) -> DetectionResult 
 
     // Filter out bounding boxes that are too large (more than 95% of image)
     let max_area = (image_area as f32 * 0.95) as u32;
-    let original_count = rects.len();
-    rects.retain(|rect| {
+    let original_count = detected_photos.len();
+    detected_photos.retain(|(rect, _, _)| {
         let area = rect.width() * rect.height();
         let is_valid = area <= max_area;
         if !is_valid {
@@ -297,23 +410,167 @@ pub fn detect_edges(_image: &GrayImage, debug_enabled: bool) -> DetectionResult 
         }
         is_valid
     });
-    if original_count != rects.len() {
+    if original_count != detected_photos.len() {
         log_message!(
             LogLevel::Debug,
-            &format!("Filtered out {} oversized boxes", original_count - rects.len())
+            &format!("Filtered out {} oversized boxes", original_count - detected_photos.len())
         );
     }
 
+    // Filter out bounding boxes that touch the image borders
+    let border_margin = 5; // Allow small margin for edge detection noise
+    let original_count = detected_photos.len();
+    detected_photos.retain(|(rect, _, _)| {
+        let touches_border = rect.min().x <= border_margin
+            || rect.min().y <= border_margin
+            || rect.max().x >= _image.width() - border_margin
+            || rect.max().y >= _image.height() - border_margin;
+        
+        if touches_border {
+            log_message!(
+                LogLevel::Debug,
+                &format!(
+                    "Filtered out border-touching detected box: x={}, y={}, w={}, h={}",
+                    rect.min().x,
+                    rect.min().y,
+                    rect.width(),
+                    rect.height()
+                )
+            );
+        }
+        !touches_border
+    });
+    if original_count != detected_photos.len() {
+        log_message!(
+            LogLevel::Debug,
+            &format!("Filtered out {} border-touching detected boxes", original_count - detected_photos.len())
+        );
+    }
+
+    // Also filter out border-touching candidates
+    let original_count = potential_candidates.len();
+    potential_candidates.retain(|(rect, _, _)| {
+        let touches_border = rect.min().x <= border_margin
+            || rect.min().y <= border_margin
+            || rect.max().x >= _image.width() - border_margin
+            || rect.max().y >= _image.height() - border_margin;
+        !touches_border
+    });
+    if original_count != potential_candidates.len() {
+        log_message!(
+            LogLevel::Debug,
+            &format!("Filtered out {} border-touching candidates", original_count - potential_candidates.len())
+        );
+    }
+
+    // Combine detected photos with candidates that are near detected photos
+    let mut all_boxes = detected_photos.clone();
+    let mut included_candidates = 0;
+    
+    for candidate in &potential_candidates {
+        let candidate_rect = candidate.0;
+        
+        // Check if this candidate is near any detected photo
+        let is_near_detected = detected_photos.iter().any(|(detected_rect, _, _)| {
+            // Check proximity (within 20% of the smaller box's dimensions)
+            let proximity_margin = ((detected_rect.width().min(detected_rect.height()) as f64) * 0.2) as u32;
+            
+            let detected_expanded = geo::Rect::new(
+                geo::Coord {
+                    x: detected_rect.min().x.saturating_sub(proximity_margin),
+                    y: detected_rect.min().y.saturating_sub(proximity_margin),
+                },
+                geo::Coord {
+                    x: detected_rect.max().x + proximity_margin,
+                    y: detected_rect.max().y + proximity_margin,
+                },
+            );
+            
+            // Check for proximity/overlap
+            !(detected_expanded.max().x < candidate_rect.min().x
+                || detected_expanded.min().x > candidate_rect.max().x
+                || detected_expanded.max().y < candidate_rect.min().y
+                || detected_expanded.min().y > candidate_rect.max().y)
+        });
+        
+        if is_near_detected {
+            all_boxes.push(candidate.clone());
+            included_candidates += 1;
+            log_message!(
+                LogLevel::Debug,
+                &format!(
+                    "Including nearby candidate: x={}, y={}, w={}, h={}",
+                    candidate_rect.min().x,
+                    candidate_rect.min().y,
+                    candidate_rect.width(),
+                    candidate_rect.height()
+                )
+            );
+        }
+    }
+    
+    log_message!(
+        LogLevel::Debug,
+        &format!("Including {} candidates near detected photos", included_candidates)
+    );
+
+    // Extract just the rectangles for merging
+    let rects: Vec<geo::Rect<u32>> = all_boxes.iter().map(|(rect, _, _)| *rect).collect();
+    
     // Merge overlapping or nearby bounding boxes
     log_message!(
         LogLevel::Debug,
-        &format!("Merging {} rectangles...", rects.len())
+        &format!("Merging {} rectangles (detected + nearby candidates)...", rects.len())
     );
-    let rects = merge_overlapping_rects(rects);
+    let merged_rects = merge_overlapping_rects(rects);
     log_message!(
         LogLevel::Debug,
-        &format!("After merging: {} rectangles", rects.len())
+        &format!("After merging: {} rectangles", merged_rects.len())
     );
+
+    // Calculate rotation angles for merged rectangles
+    // For each merged rect, find the best matching original contour and calculate its rotation
+    let mut photos = Vec::new();
+    for merged_rect in merged_rects {
+        // Find the contour that best matches this merged rectangle (from all_boxes)
+        let best_match = all_boxes.iter()
+            .filter(|(rect, _, _)| {
+                // Check if this original rect contributed to the merged rect
+                let intersects = !(merged_rect.max().x < rect.min().x
+                    || merged_rect.min().x > rect.max().x
+                    || merged_rect.max().y < rect.min().y
+                    || merged_rect.min().y > rect.max().y);
+                intersects
+            })
+            .max_by_key(|(rect, _, _)| rect.width() * rect.height());
+        
+        let rotation_angle = if let Some((_, _, contour)) = best_match {
+            let angle = calculate_rotation_angle(contour);
+            
+            // Only apply rotation if it's significant (> 1 degree)
+            if angle.abs() > 1.0 {
+                log_message!(
+                    LogLevel::Debug,
+                    &format!(
+                        "Detected rotation: {:.1}° for box at ({},{})",
+                        angle,
+                        merged_rect.min().x,
+                        merged_rect.min().y
+                    )
+                );
+                angle
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
+        
+        photos.push(DetectedPhoto {
+            rect: merged_rect,
+            rotation_angle,
+        });
+    }
 
     let debug_info = if debug_enabled {
         Some(DebugInfo {
@@ -329,7 +586,7 @@ pub fn detect_edges(_image: &GrayImage, debug_enabled: bool) -> DetectionResult 
     };
 
     DetectionResult {
-        rects,
+        photos,
         debug_info,
     }
 }
