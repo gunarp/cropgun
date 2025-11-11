@@ -19,7 +19,8 @@ impl ImageProcessor {
 
         log_message!(LogLevel::Info, &format!("Image processing completed for {}", input_path));
 
-        let bounding_boxes = detect_edges(&processed_img);
+        let detection_result = detect_edges(&processed_img, self.config.debug_enabled);
+        let bounding_boxes = &detection_result.rects;
         let mut output_files = Vec::new();
 
         for (i, rect) in bounding_boxes.iter().enumerate() {
@@ -58,7 +59,7 @@ impl ImageProcessor {
         }
 
         if self.config.debug_enabled {
-            self.save_debug_image(&img, &bounding_boxes, scaling_factor, input_path)?;
+            self.save_debug_preview(&img, &detection_result, scaling_factor, input_path)?;
         }
 
         Ok(ProcessingResult {
@@ -94,36 +95,22 @@ impl ImageProcessor {
         Ok(results)
     }
 
-    fn save_debug_image(
+    fn save_debug_preview(
         &self,
         img: &image::DynamicImage,
-        bounding_boxes: &[geo::Rect<u32>],
+        detection_result: &crate::image_ops::DetectionResult,
         scaling_factor: f64,
         input_path: &str,
     ) -> Result<(), String> {
-        let mut debug_img = img.clone().to_rgb8();
-
-        for rect in bounding_boxes.iter() {
-            let scaled_x = (rect.min().x as f64 / scaling_factor).round() as u32;
-            let scaled_y = (rect.min().y as f64 / scaling_factor).round() as u32;
-            let scaled_w = (rect.width() as f64 / scaling_factor).round() as u32;
-            let scaled_h = (rect.height() as f64 / scaling_factor).round() as u32;
-
-            imageproc::drawing::draw_hollow_rect_mut(
-                &mut debug_img,
-                imageproc::rect::Rect::at(scaled_x as i32, scaled_y as i32)
-                    .of_size(scaled_w, scaled_h),
-                image::Rgb([255, 0, 0]),
-            );
-        }
-
-        let debug_filename = format!("{}_debug.png", Path::new(input_path).file_stem().and_then(|s| s.to_str()).unwrap_or("debug"));
+        use image::Rgb;
+        
+        let debug_info = detection_result.debug_info.as_ref()
+            .ok_or("Debug info not available")?;
         
         // Determine output directory
         let output_dir = if let Some(ref custom_dir) = self.config.output_dir {
             custom_dir.clone()
         } else {
-            // Default to the input file's directory
             Path::new(input_path)
                 .parent()
                 .and_then(|p| p.to_str())
@@ -131,12 +118,257 @@ impl ImageProcessor {
                 .to_string()
         };
         
+        // Convert grayscale intermediate images to RGB for visualization
+        let blurred_rgb = gray_to_rgb(&debug_info.blurred);
+        let edges_rgb = gray_to_rgb(&debug_info.edges);
+        let dilated_rgb = gray_to_rgb(&debug_info.dilated);
+        let closed_rgb = gray_to_rgb(&debug_info.closed);
+        let cleaned_rgb = gray_to_rgb(&debug_info.cleaned);
+        
+        // Create final result image with accepted boxes (green) and rejected boxes (red)
+        let mut result_img = img.clone().to_rgb8();
+        
+        // Draw rejected candidates in red
+        for (rect, rectangularity) in &debug_info.all_contours {
+            let is_accepted = detection_result.rects.contains(rect);
+            if !is_accepted {
+                let scaled_x = (rect.min().x as f64 / scaling_factor).round() as u32;
+                let scaled_y = (rect.min().y as f64 / scaling_factor).round() as u32;
+                let scaled_w = (rect.width() as f64 / scaling_factor).round() as u32;
+                let scaled_h = (rect.height() as f64 / scaling_factor).round() as u32;
+                
+                // Draw red box for rejected
+                draw_rect_with_label(
+                    &mut result_img,
+                    scaled_x,
+                    scaled_y,
+                    scaled_w,
+                    scaled_h,
+                    Rgb([255, 0, 0]),
+                    &format!("X {:.2}", rectangularity)
+                );
+            }
+        }
+        
+        // Draw accepted boxes in green (on top)
+        for rect in &detection_result.rects {
+            let scaled_x = (rect.min().x as f64 / scaling_factor).round() as u32;
+            let scaled_y = (rect.min().y as f64 / scaling_factor).round() as u32;
+            let scaled_w = (rect.width() as f64 / scaling_factor).round() as u32;
+            let scaled_h = (rect.height() as f64 / scaling_factor).round() as u32;
+            
+            // Find rectangularity for this rect
+            let rectangularity = debug_info.all_contours
+                .iter()
+                .find(|(r, _)| r == rect)
+                .map(|(_, s)| *s)
+                .unwrap_or(0.0);
+            
+            // Draw green box for accepted
+            draw_rect_with_label(
+                &mut result_img,
+                scaled_x,
+                scaled_y,
+                scaled_w,
+                scaled_h,
+                Rgb([0, 255, 0]),
+                &format!("✓ {:.2}", rectangularity)
+            );
+        }
+        
+        // Create a composite preview image showing all stages
+        let preview = create_preview_grid(
+            vec![
+                ("1. Blurred", blurred_rgb),
+                ("2. Canny Edges", edges_rgb),
+                ("3. Dilated", dilated_rgb),
+                ("4. Closed (Morphological)", closed_rgb),
+                ("5. Final Edges", cleaned_rgb),
+                ("6. Detected Candidates", result_img),
+            ],
+            2 // columns
+        )?;
+        
+        let debug_filename = format!("{}_debug_preview.png", 
+            Path::new(input_path).file_stem().and_then(|s| s.to_str()).unwrap_or("debug"));
         let output_path = format!("{}/{}", output_dir, debug_filename);
-
-        debug_img
+        
+        preview
             .save(&output_path)
-            .map_err(|e| format!("Failed to save debug image: {}", e))?;
-
+            .map_err(|e| format!("Failed to save debug preview: {}", e))?;
+        
+        log_message!(LogLevel::Info, &format!("Debug preview saved to: {}", output_path));
+        
         Ok(())
     }
+}
+
+fn gray_to_rgb(gray: &image::GrayImage) -> image::RgbImage {
+    let (width, height) = gray.dimensions();
+    let mut rgb = image::RgbImage::new(width, height);
+    for y in 0..height {
+        for x in 0..width {
+            let val = gray.get_pixel(x, y)[0];
+            rgb.put_pixel(x, y, image::Rgb([val, val, val]));
+        }
+    }
+    rgb
+}
+
+fn draw_rect_with_label(
+    img: &mut image::RgbImage,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    color: image::Rgb<u8>,
+    _label: &str, // Label parameter kept for future use but not rendered
+) {
+    // Draw hollow rectangle with thicker lines for better visibility
+    let thickness = 2;
+    for i in 0..thickness {
+        let rect = imageproc::rect::Rect::at((x as i32) - i, (y as i32) - i)
+            .of_size(w + (2 * i as u32), h + (2 * i as u32));
+        imageproc::drawing::draw_hollow_rect_mut(img, rect, color);
+    }
+}
+
+fn draw_label_box(
+    img: &mut image::RgbImage,
+    x: u32,
+    y: u32,
+    width: u32,
+    label: &str,
+) {
+    // Draw a colored label bar with the text prominently displayed
+    let label_height = 35u32;
+    
+    // Determine color based on step number (extract from label)
+    let color = if label.starts_with("1") {
+        image::Rgb([100, 149, 237]) // Cornflower blue
+    } else if label.starts_with("2") {
+        image::Rgb([60, 179, 113]) // Medium sea green
+    } else if label.starts_with("3") {
+        image::Rgb([255, 165, 0]) // Orange
+    } else if label.starts_with("4") {
+        image::Rgb([220, 20, 60]) // Crimson
+    } else if label.starts_with("5") {
+        image::Rgb([147, 112, 219]) // Medium purple
+    } else if label.starts_with("6") {
+        image::Rgb([255, 215, 0]) // Gold
+    } else {
+        image::Rgb([128, 128, 128]) // Gray
+    };
+    
+    // Draw colored background bar
+    imageproc::drawing::draw_filled_rect_mut(
+        img,
+        imageproc::rect::Rect::at(x as i32, y as i32).of_size(width, label_height),
+        color,
+    );
+    
+    // Draw black border
+    for i in 0..2 {
+        imageproc::drawing::draw_hollow_rect_mut(
+            img,
+            imageproc::rect::Rect::at(x as i32 + i, y as i32 + i)
+                .of_size(width - 2 * i as u32, label_height - 2 * i as u32),
+            image::Rgb([0, 0, 0]),
+        );
+    }
+    
+    // Draw large step number on the left
+    let step_num_size = 20u32;
+    let step_num_x = x + 5;
+    let step_num_y = y + (label_height - step_num_size) / 2;
+    
+    if let Some(first_char) = label.chars().next() {
+        if first_char.is_ascii_digit() {
+            imageproc::drawing::draw_filled_rect_mut(
+                img,
+                imageproc::rect::Rect::at(step_num_x as i32, step_num_y as i32)
+                    .of_size(step_num_size, step_num_size),
+                image::Rgb([0, 0, 0]),
+            );
+            imageproc::drawing::draw_filled_rect_mut(
+                img,
+                imageproc::rect::Rect::at(step_num_x as i32 + 2, step_num_y as i32 + 2)
+                    .of_size(step_num_size - 4, step_num_size - 4),
+                image::Rgb([255, 255, 255]),
+            );
+        }
+    }
+    
+    // Draw text label bars to represent the text (visual markers)
+    let text_start_x = x + 35;
+    let text_y = y + label_height / 2 - 3;
+    let char_width = 8u32;
+    
+    for (idx, ch) in label.chars().skip(3).enumerate() { // Skip "1. " part
+        if ch == ' ' {
+            continue;
+        }
+        let char_x = text_start_x + idx as u32 * (char_width + 1);
+        let height = if ch.is_uppercase() || ch.is_ascii_digit() { 6 } else { 4 };
+        let y_offset = if ch.is_uppercase() || ch.is_ascii_digit() { 0 } else { 2 };
+        
+        imageproc::drawing::draw_filled_rect_mut(
+            img,
+            imageproc::rect::Rect::at(char_x as i32, (text_y + y_offset) as i32)
+                .of_size(char_width - 1, height),
+            image::Rgb([0, 0, 0]),
+        );
+    }
+}
+
+fn create_preview_grid(
+    images: Vec<(&str, image::RgbImage)>,
+    columns: usize,
+) -> Result<image::RgbImage, String> {
+    if images.is_empty() {
+        return Err("No images to create preview".to_string());
+    }
+    
+    // Find the maximum dimensions
+    let max_width = images.iter().map(|(_, img)| img.width()).max().unwrap();
+    let max_height = images.iter().map(|(_, img)| img.height()).max().unwrap();
+    
+    // Scale all images to fit in a reasonable preview size
+    let target_width = 800u32;
+    let scale = target_width as f64 / max_width as f64;
+    let scaled_width = target_width;
+    let scaled_height = (max_height as f64 * scale) as u32;
+    
+    let rows = (images.len() + columns - 1) / columns;
+    let padding = 20u32;
+    let label_height = 35u32; // Increased for better text visibility
+    
+    let grid_width = columns as u32 * (scaled_width + padding) + padding;
+    let grid_height = rows as u32 * (scaled_height + label_height + padding) + padding;
+    
+    let mut grid = image::RgbImage::from_pixel(grid_width, grid_height, image::Rgb([40, 40, 40]));
+    
+    for (idx, (label, img)) in images.iter().enumerate() {
+        let row = idx / columns;
+        let col = idx % columns;
+        
+        let x = padding + col as u32 * (scaled_width + padding);
+        let y = padding + row as u32 * (scaled_height + label_height + padding);
+        
+        // Resize image to fit
+        let resized = image::imageops::resize(
+            img,
+            scaled_width,
+            scaled_height,
+            image::imageops::FilterType::Lanczos3,
+        );
+        
+        // Draw colored label box
+        draw_label_box(&mut grid, x, y, scaled_width, label);
+        
+        // Copy image
+        image::imageops::overlay(&mut grid, &resized, x as i64, (y + label_height) as i64);
+    }
+    
+    Ok(grid)
 }
